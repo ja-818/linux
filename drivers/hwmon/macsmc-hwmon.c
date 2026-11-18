@@ -452,23 +452,24 @@ static int macsmc_hwmon_fans_relock(struct macsmc_hwmon *hwmon)
 static int macsmc_hwmon_fan_auto(struct macsmc_hwmon *hwmon,
 				 struct macsmc_hwmon_fan *fan)
 {
-	int ret, relock;
+	int ret;
 
-	if (!fan->manual)
-		return 0;
-
-	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode, MACSMC_FAN_MODE_AUTO);
-	fan->manual = false;
-	fan->kernel = false;
-	hwmon->fan.manual--;
-
-	if (hwmon->fan.unlocked && !hwmon->fan.manual) {
-		relock = macsmc_hwmon_fans_relock(hwmon);
-		if (relock)
-			return relock;
+	if (fan->manual) {
+		ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode, MACSMC_FAN_MODE_AUTO);
+		/* At shutdown or suspend the final unlock-key relock hands all
+		 * fans back, even if one fan refuses its individual AUTO write.
+		 */
+		if (ret < 0 && !(hwmon->fan.stopped && hwmon->fan.unlocked))
+			return ret;
+		fan->manual = false;
+		fan->kernel = false;
+		hwmon->fan.manual--;
 	}
 
-	return ret < 0 ? ret : 0;
+	if (hwmon->fan.unlocked && !hwmon->fan.manual)
+		return macsmc_hwmon_fans_relock(hwmon);
+
+	return 0;
 }
 
 /*
@@ -605,14 +606,16 @@ static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long va
  * returns to the SMC at suspend, shutdown and unbind. Only fans whose device
  * tree node names their mode, target, minimum and maximum keys take part.
  *
- * Return: the first such fan's target in rpm (0 once handed back), -ENODEV
- * without such a fan, -EBUSY while stopped, or the first error.
+ * Return: the first such fan's target in rpm for a non-zero @permille, or 0
+ * when @permille is 0 (even when no fan is kernel-owned); -ENODEV if @dev is
+ * unbound or for a non-zero @permille without such a fan; -EBUSY while
+ * stopped for a non-zero @permille; or the first error.
  */
 int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
 			      unsigned int min_step_rpm)
 {
 	struct macsmc_hwmon *hwmon = dev_get_drvdata(dev);
-	long first = -ENODEV;
+	long first = permille ? -ENODEV : 0;
 	int ret = 0;
 	u32 i;
 
@@ -638,8 +641,6 @@ int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
 			continue;
 
 		if (!permille) {
-			if (first < 0)
-				first = 0;
 			err = macsmc_hwmon_fan_auto(hwmon, fan);
 			if (err && !ret)
 				ret = err;
