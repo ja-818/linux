@@ -477,3 +477,43 @@
 	};
 };
 #endif
+
+/*
+ * Die 0's memory cache controllers (ADT /arm-io/mcc: amcc-count 8,
+ * dcs-count-per-amcc 4, AMCC a at 0x2220000000 + a * 0x2000000, four 16 KiB
+ * planes at +0x40000). Both M5 Pro and M5 Max boards include this file; M5 Pro
+ * enables AMCC 0..3 only (ADT amcc-enable-mask = 0xf, 16 planes), and M5 Max
+ * ships in both 460 GB/s (binned) and 614 GB/s (amcc-enable-mask = 0xff,
+ * 8 AMCCs) variants under the same board DTS. List the four AMCCs verified
+ * across both parts here until the boot loader populates reg from the live
+ * ADT's amcc-enable-mask; ranges covers all eight AMCCs for that update.
+ *
+ * The boot loader leaves every enabled plane's ways powered with allocation
+ * disabled until apple-mcc allows it; AMCC 4..7 stay non-allocating on six-
+ * and eight-AMCC parts until the boot loader adds their apertures to reg. On
+ * laptops, each board's framebuffer0 names &dcp as its display so allocation
+ * waits for the DCP to retire the boot scanout (and stays off when the boot
+ * loader keeps simpledrm).
+ */
+/ {
+	soc@2220000000 {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges = <0x22 0x20000000 0x22 0x20000000 0x0 0x10000000>;
+		nonposted-mmio;
+
+		mcc: memory-controller@2220000000 {
+			compatible = "apple,t6050-mcc";
+			reg = <0x22 0x20000000 0x0 0x4000>, <0x22 0x20040000 0x0 0x4000>,
+			      <0x22 0x20080000 0x0 0x4000>, <0x22 0x200c0000 0x0 0x4000>,
+			      <0x22 0x22000000 0x0 0x4000>, <0x22 0x22040000 0x0 0x4000>,
+			      <0x22 0x22080000 0x0 0x4000>, <0x22 0x220c0000 0x0 0x4000>,
+			      <0x22 0x24000000 0x0 0x4000>, <0x22 0x24040000 0x0 0x4000>,
+			      <0x22 0x24080000 0x0 0x4000>, <0x22 0x240c0000 0x0 0x4000>,
+			      <0x22 0x26000000 0x0 0x4000>, <0x22 0x26040000 0x0 0x4000>,
+			      <0x22 0x26080000 0x0 0x4000>, <0x22 0x260c0000 0x0 0x4000>;
+			apple,boot-dma-devices = <&dcp>;
+		};
+	};
+};
