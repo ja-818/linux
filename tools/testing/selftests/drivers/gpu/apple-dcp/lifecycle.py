@@ -791,6 +791,9 @@ struct dptx_port { bool enabled, connected, available; void *service; };
 #define DCP_FIRMWARE_V_27_0 2
 #define DCP_IOMFB_METHODS_H17G 7
 #define DRM_MODE_CONNECTOR_eDP 14
+#define PM_SUSPEND_ON 0
+#define PM_SUSPEND_TO_IDLE 1
+static int pm_suspend_target_state = PM_SUSPEND_ON;
 struct apple_dcp {
  int fw_compat, connector_type;
  struct { int iomfb_method_profile; } hw;
@@ -877,6 +880,23 @@ int main(void)
  dcp.fw_compat = DCP_FIRMWARE_V_27_0; dcp_poweroff(&pdev);
  assert(poweroffs == 1 && hpd_drops == 0 && disconnects == 1);
  assert(!dcp.dptxport[0].connected && dcp.hdmi_crtc_off);
+ /* A CRTC disabled for a system sleep keeps the link: the resume finds it trained. */
+ init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp; hdmi_gpio = true;
+ dcp.fw_compat = DCP_FIRMWARE_V_27_0; pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+ dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && disconnects == 0 && dcp.dptxport[0].connected);
+ assert(!dcp.hdmi_crtc_off);
+ /* ...unless the cable is gone. */
+ hdmi_gpio = false; init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp;
+ dcp.fw_compat = DCP_FIRMWARE_V_27_0; dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && disconnects == 1 && !dcp.hdmi_crtc_off);
+ pm_suspend_target_state = PM_SUSPEND_ON; hdmi_gpio = true;
+ /* The desktop turns the CRTC off after the firmware's unplug at sleep: keep the link. */
+ init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp; hdmi_gpio = true;
+ dcp.fw_compat = DCP_FIRMWARE_V_27_0; connector.connected = false;
+ dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && disconnects == 0 && dcp.dptxport[0].connected);
+ assert(!dcp.hdmi_crtc_off);
  /* Other firmware keeps it while the cable is attached... */
  init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp; hdmi_gpio = true;
  dcp_poweroff(&pdev);
