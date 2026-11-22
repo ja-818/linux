@@ -215,10 +215,12 @@ def t6041_v27_admission(root):
     selector = selector_full[:selector_full.index(cutoff)] + '\n\t(void)v14_board;\n\treturn DCP_FIRMWARE_UNKNOWN;\n}\n'
     return r'''
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 typedef uint32_t u32;
 enum dcp_firmware_version {
     DCP_FIRMWARE_UNKNOWN,
