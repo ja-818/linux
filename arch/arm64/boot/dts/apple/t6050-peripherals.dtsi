@@ -363,6 +363,24 @@
 	};
 };
 
+/*
+ * The ADT's PMGR device table gives every ATC's COMMON state a fabric parent: ATC0 and ATC1
+ * hang off FAB3_SOC, ATC2 and ATC3 off FAB5_SOC. Without the link, genpd counts no
+ * powered child under the fabric while a port's PHY domains are held on, asks for the
+ * fabric to go off, and the PMGR refuses the write.
+ */
+&ps_atc1_common {
+	power-domains = <&ps_fab3_soc>;
+};
+
+&ps_atc2_common {
+	power-domains = <&ps_fab5_soc>;
+};
+
+&ps_atc3_common {
+	power-domains = <&ps_fab5_soc>;
+};
+
 &pmgr1 {
 	ps_ispsens0: power-controller@100 {
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
