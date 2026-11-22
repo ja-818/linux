@@ -23,6 +23,7 @@
 #include <linux/phy/phy.h>
 #include <linux/phy/phy-dp.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/string.h>
 #include <linux/types.h>
 
@@ -932,14 +933,36 @@ static int dptx_phy_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 	struct apple_dptx_phy *dptx_phy = phy_get_drvdata(phy);
 
 	if (dptx_phy->hw.type == DPTX_PHY_T6050) {
-		int ret = -EINVAL;
+		bool was_active;
+		int pm_ret, ret = -EINVAL;
+
+		/* An active link holds the PHY's power domain, see dptx_phy_probe(). */
+		if (mode == PHY_MODE_DP) {
+			if (dptx_phy->active)
+				return 0;
+			ret = phy_pm_runtime_get_sync(phy);
+			if (ret < 0)
+				return ret;
+		}
 
 		mutex_lock(&dptx_phy->lock);
-		if (mode == PHY_MODE_INVALID)
+		was_active = dptx_phy->active;
+		if (mode == PHY_MODE_INVALID) {
 			ret = t6050_deactivate(dptx_phy);
-		else if (mode == PHY_MODE_DP)
-			ret = dptx_phy->active ? 0 : t6050_activate(dptx_phy);
+		} else if (mode == PHY_MODE_DP) {
+			ret = t6050_activate(dptx_phy);
+			if (ret)
+				t6050_deactivate(dptx_phy);
+		}
 		mutex_unlock(&dptx_phy->lock);
+
+		if (mode == PHY_MODE_DP && ret) {
+			phy_pm_runtime_put_sync(phy);
+		} else if (mode == PHY_MODE_INVALID && was_active && !ret) {
+			pm_ret = phy_pm_runtime_put_sync(phy);
+			if (pm_ret < 0)
+				ret = pm_ret;
+		}
 		return ret;
 	}
 
@@ -1049,6 +1072,7 @@ static int dptx_phy_probe(struct platform_device *pdev)
 {
 	struct apple_dptx_phy *dptx_phy;
 	struct device *dev = &pdev->dev;
+	int ret;
 
 	dptx_phy = devm_kzalloc(dev, sizeof(*dptx_phy), GFP_KERNEL);
 	if (!dptx_phy)
@@ -1069,6 +1093,17 @@ static int dptx_phy_probe(struct platform_device *pdev)
 		devm_platform_ioremap_resource_byname(pdev, "dptx");
 	if (IS_ERR(dptx_phy->regs.dptx))
 		return PTR_ERR(dptx_phy->regs.dptx);
+
+	/*
+	 * The T6050 PHY powers its blocks up and down with the link
+	 * (t6050_activate(), t6050_deactivate()); runtime PM lets its power
+	 * domain follow.
+	 */
+	if (dptx_phy->hw.type == DPTX_PHY_T6050) {
+		ret = devm_pm_runtime_enable(dev);
+		if (ret)
+			return ret;
+	}
 
 	/* create phy */
 	dptx_phy->phy_dp =
