@@ -550,6 +550,51 @@ static void macsmc_fan_test_spinning(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
 }
 
+/* Manual-only kernel fan request touches only apple,fan-manual-control fans. */
+static void macsmc_fan_test_manual_only_request(struct kunit *test)
+{
+	struct macsmc_fan_test *t = test->priv;
+	struct macsmc_hwmon_fan_assist policy = {};
+	struct device dev = {};
+
+	dev_set_drvdata(&dev, &t->hwmon);
+	t->fans[0].attrs = HWMON_F_TARGET | HWMON_F_MIN | HWMON_F_MAX;
+	t->fans[1].attrs = HWMON_F_TARGET | HWMON_F_MIN | HWMON_F_MAX;
+	t->fans[0].manual_control = true;
+	t->fans[1].manual_control = false;
+	t->hwmon.fan_assist.trigger_mc = 98000;
+	t->hwmon.fan_assist.release_mc = 82000;
+	t->hwmon.fan_assist.hold_ms = 30000;
+	t->hwmon.fan_assist_valid = true;
+
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_hotspot_assist_policy(&dev, &policy), 0);
+	KUNIT_EXPECT_EQ(test, policy.trigger_mc, 98000);
+	KUNIT_EXPECT_EQ(test, policy.release_mc, 82000);
+	KUNIT_EXPECT_EQ(test, policy.hold_ms, 30000U);
+
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request_manual(&dev, 1000, 0), 5777);
+	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_MANUAL);
+	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F5777);
+	KUNIT_EXPECT_EQ(test, t->mode[1], MACSMC_FAN_MODE_AUTO);
+	KUNIT_EXPECT_EQ(test, t->target[1], 0);
+	KUNIT_EXPECT_TRUE(test, t->fans[0].kernel);
+	KUNIT_EXPECT_FALSE(test, t->fans[1].kernel);
+	KUNIT_EXPECT_FALSE(test, t->fans[1].manual);
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request_manual(&dev, 0, 0), 0);
+	fan_test_released(test, t);
+
+	/* Without any manual-control fan, policy and boost return -ENODEV. */
+	t->fans[0].manual_control = false;
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_hotspot_assist_policy(&dev, NULL), -ENODEV);
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fans_request_manual(&dev, 1000, 0), -ENODEV);
+	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
+
+	/* Without DT-supplied trip thresholds, policy returns -ENODEV. */
+	t->fans[0].manual_control = true;
+	t->hwmon.fan_assist_valid = false;
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_hotspot_assist_policy(&dev, NULL), -ENODEV);
+}
+
 static struct kunit_case macsmc_fan_test_cases[] = {
 	KUNIT_CASE(macsmc_fan_test_stopped_manual_busy),
 	KUNIT_CASE(macsmc_fan_test_manual_busy_timeout),
@@ -564,6 +609,7 @@ static struct kunit_case macsmc_fan_test_cases[] = {
 	KUNIT_CASE(macsmc_fan_test_untouched),
 	KUNIT_CASE(macsmc_fan_test_suspend_manual),
 	KUNIT_CASE(macsmc_fan_test_unlock_fails),
+	KUNIT_CASE(macsmc_fan_test_manual_only_request),
 	{}
 };
 
