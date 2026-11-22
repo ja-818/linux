@@ -103,6 +103,8 @@ pub(crate) struct Variant {
     pub(crate) compute: super::compute::ComputeProgram,
     pub(crate) opening_record: bool,
     pub(crate) split_firmware_area: bool,
+    /// Uses the 26B123 initialization layouts and scheduler-release opcode.
+    pub(crate) v26b123: bool,
     /// Command validation applies the M5 command set: resource commands, the M5 render and
     /// compute flags, 8x MSAA and the M5 tile-buffer limit.
     pub(crate) m5_commands: bool,
@@ -175,6 +177,7 @@ pub(crate) const V26A428: Variant = Variant {
     compute: super::compute::ComputeProgram::G17P,
     opening_record: true,
     split_firmware_area: false,
+    v26b123: false,
     m5_commands: false,
     registration_power_hold: true,
     m5_layouts: None,
@@ -216,6 +219,7 @@ pub(crate) const V25G83: Variant = Variant {
     compute: super::compute::ComputeProgram::G17P,
     opening_record: true,
     split_firmware_area: false,
+    v26b123: false,
     m5_commands: false,
     registration_power_hold: true,
     m5_layouts: None,
@@ -259,8 +263,16 @@ pub(crate) const V25F84: Variant = Variant {
     ..V25G83
 };
 
+/// The T6041 27.2 firmware (26B123, `mBoot-20457.41.3`).
+pub(crate) const V26B123: Variant = Variant {
+    split_firmware_area: false,
+    v26b123: true,
+    ..V25F84
+};
+
 const _: () = {
     assert!(super::queue::PointerBlock::valid_layout(&V26A428.pointers));
     assert!(super::queue::PointerBlock::valid_layout(&V25G83.pointers));
     assert!(super::queue::PointerBlock::valid_layout(&V25F84.pointers));
+    assert!(super::queue::PointerBlock::valid_layout(&V26B123.pointers));
 };
