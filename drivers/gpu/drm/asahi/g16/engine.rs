@@ -554,6 +554,10 @@ pub(crate) struct Engine {
     pub(crate) ta_registered: bool,
     /// A ready prefix waits only for a record's consumption: repoll sooner.
     pub(crate) chan_wait: bool,
+    /// A ready same-VM pending job is blocked solely on flight, pass/compute slot, or work-ring
+    /// headroom (not cross-VM/InitBM drain, external fences, or CPU timestamp waits): repoll
+    /// sooner to refill freed slots promptly.
+    pub(crate) slot_wait: bool,
     /// An EP 0x20 event arrived with a flight still settling its final receipt: repoll sooner.
     pub(crate) short_repoll: bool,
     /// Progress tracking of the oldest compute and render flights.
@@ -594,6 +598,7 @@ impl Engine {
             render_registered: false,
             ta_registered: false,
             chan_wait: false,
+            slot_wait: false,
             short_repoll: false,
             progress_flight: [0; 2],
             progress: [None; 3],
@@ -934,6 +939,7 @@ impl Firmware {
         let mut batch_published = 0u64;
 
         self.engine.chan_wait = false;
+        self.engine.slot_wait = false;
         while self.recovery.failed().is_none()
             && !self.engine.frozen
             && !self.engine.pending.is_empty()
@@ -976,6 +982,11 @@ impl Firmware {
                 match alt {
                     Some(i) => job = self.engine.pending[i].clone(),
                     None => {
+                        self.engine.slot_wait = self
+                            .engine
+                            .pending
+                            .iter()
+                            .any(|cand| self.blocked_on_slot_headroom(cand));
                         self.engine.stats.hold[0] += 1;
                         break;
                     }
@@ -1186,6 +1197,47 @@ impl Firmware {
                     .resources
                     .pb_slots()
                     .is_ok_and(|n| self.pools.can_pipeline_within(&job.vm, n)))
+    }
+
+    /// Whether `job` is ready to run on the same VM but currently blocked solely on
+    /// flight-depth or pass/compute-slot headroom (not on cross-VM/InitBM/recovery drain,
+    /// external sync dependencies, or CPU timestamp-publish waits).
+    fn blocked_on_slot_headroom(&self, job: &Arc<Job>) -> bool {
+        let e = &self.engine;
+        if e.flights.is_empty() || self.needs_engine_drain(job) {
+            return false;
+        }
+        let sent = job.progress.sent();
+        if job.check_command_dependencies(sent).is_err() {
+            return false;
+        }
+        if e.flights.len() >= super::hw::sizes::FLIGHTS {
+            return true;
+        }
+        match command(job, sent) {
+            Some(Command::Compute(_)) => {
+                let compute_count: usize = e.flights.iter().map(|f| f.computes as usize).sum();
+                compute_count > 0
+                    && !self.slots.compute_exhausted()
+                    && (compute_count >= params::compute_flights()
+                        || job
+                            .resources
+                            .compute_units()
+                            .is_ok_and(|units| !self.slots.compute_available(units)))
+            }
+            Some(Command::Render(_)) => {
+                let render_count: usize = e.flights.iter().map(|f| f.renders as usize).sum();
+                render_count > 0
+                    && !self.slots.render_exhausted()
+                    && !self.pools.exhausted()
+                    && (render_count >= params::render_flights()
+                        || job
+                            .resources
+                            .render_passes()
+                            .is_ok_and(|passes| !self.slots.pass_available(passes)))
+            }
+            None => false,
+        }
     }
 
     /// Whether `job`'s next command may be published behind the flights in flight:
@@ -1635,6 +1687,7 @@ impl Firmware {
                     || prefix.fs_head.wrapping_sub(fs_read) % sizes::QUEUE_CAP
                         >= sizes::QUEUE_CAP - 5
                 {
+                    self.engine.slot_wait = true;
                     return Err(EAGAIN);
                 }
             } else {
@@ -1643,6 +1696,7 @@ impl Firmware {
                 if c_read >= 256
                     || prefix.c_head.wrapping_sub(c_read) % sizes::QUEUE_CAP >= sizes::QUEUE_CAP - 3
                 {
+                    self.engine.slot_wait = true;
                     return Err(EAGAIN);
                 }
             }
@@ -1773,14 +1827,14 @@ impl Firmware {
                 }) {
                     return Err(E2BIG);
                 }
-                let k = self
-                    .slots
-                    .pick_pass_in(&job.resources, &geometry, 0)
-                    .ok_or(EAGAIN)?;
+                let Some(k) = self.slots.pick_pass_in(&job.resources, &geometry, 0) else {
+                    self.engine.slot_wait = true;
+                    return Err(EAGAIN);
+                };
                 f.claims.pass[0] = k as u32;
                 f.claims.pass_count = 1;
-                f.claims.pass_mask = 1 << k;
-                self.slots.pass_busy |= 1 << k;
+                f.claims.pass_mask = 1u64 << k;
+                self.slots.pass_busy |= 1u64 << k;
                 self.prefix_render(job, r, geometry, &mut prefix, f, behind, class_behind)?;
                 // Batch consecutive ready non-InitBM render passes of the same SUBMIT into
                 // one TA/FS producer advance, one UMA submitted update, and one SubmitRecord.
@@ -1866,8 +1920,8 @@ impl Firmware {
                         let member = prefix.renders as usize;
                         f.claims.pass[member] = k2 as u32;
                         f.claims.pass_count += 1;
-                        f.claims.pass_mask |= 1 << k2;
-                        self.slots.pass_busy |= 1 << k2;
+                        f.claims.pass_mask |= 1u64 << k2;
+                        self.slots.pass_busy |= 1u64 << k2;
                         self.prefix_render(
                             job,
                             r2,
