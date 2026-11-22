@@ -46,8 +46,8 @@ struct Graph{compute:CGraph,render:RGraph}
 struct Vm{slot:u32}struct Job{vm:Vm,resources:Resources}
 struct Resources{compute:Vec<CUnit>,passes:Vec<RUnit>,pools:Pools}
 impl Resources{fn compute(&self)->Result<&Self>{Ok(self)}fn render(&self)->Result<&Self>{Ok(self)}fn compute_unit(&self,k:usize)->Result<&CUnit>{self.compute.get(k).ok_or(EINVAL)}fn render_pass(&self,k:usize)->Result<&RUnit>{self.passes.get(k).ok_or(EINVAL)}fn pb_retired(&self,k:usize)->Result<bool>{self.pools.retired(k)}fn pb_retired_at(&self,k:usize,target:u64)->Result<bool>{self.pools.retired_at(k,target)}}
-struct Claims{slot:[u32;16],slot_count:u32,pass:[u32;1]}
-struct Flight{computes:u32,renders:u32,target:u32,ta_target:u32,fs_target:u32,job:Job,claims:Claims,head:u32,ta_head:u32,fs_head:u32,rec:[u32;3],pb_slot:u32,uma_submitted:u64,csubmitted:[u64;16],recovery_suspect:bool,recovery_started_ns:u64,doomed:bool}
+struct Claims{slot:[u32;16],slot_count:u32,pass:[u32;4]}
+struct Flight{computes:u32,renders:u32,target:u32,ta_target:u32,fs_target:u32,job:Job,claims:Claims,head:u32,ta_head:u32,fs_head:u32,rec:[u32;3],pb_slot:u32,uma_submitted:u64,csubmitted:[u64;16],stage_ts_mask:u64,recovery_suspect:bool,recovery_started_ns:u64,doomed:bool}
 struct Engine{flights:Vec<Flight>,target:u32,ta_target:u32,fs_target:u32,retired_ticks:[u64;4]}
 fn stamp_reached(observed:u32,own:u32,tail:u32)->bool{logic::stamp_reached(observed,own,tail)}
 impl Engine{fn oldest(&self)->Option<&Flight>{self.flights.first()}}
@@ -58,7 +58,8 @@ struct Slots{scrub:Scrub}
 struct Pools{full:bool,completed:u64}
 impl Pools{fn retired(&self,_k:usize)->Result<bool>{Ok(self.full)}fn retired_at(&self,_k:usize,target:u64)->Result<bool>{Ok(self.full && target!=0 && self.completed>=target)}}
 struct Firmware{graph:Graph,engine:Engine,slots:Slots,pools:Pools,queue_passed:bool}
-fn rmb(){}fn now_ns()->u64{100_000_000}
+thread_local! { static CLOCK: Cell<u64> = const { Cell::new(100_000_000) }; }
+fn rmb(){}fn now_ns()->u64{CLOCK.with(|c|c.get())}
 impl Firmware{
     fn queue_receipt(&self,_ch:Channel,_state:&Object,_info:&Object,_head:u32,_rec:u32)->Result<bool>{Ok(self.queue_passed)}
     fn queue_passed(&self,_ch:Channel,_state:&Object,_info:&Object,_f:&Flight)->Result<bool>{Ok(self.queue_passed)}
@@ -76,7 +77,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     let mut f=Firmware{
         graph:Graph{compute:CGraph{fw_stamp:Object::default(),qstate:Object::default(),qinfo:Object::default(),notifier:Object::default()},
             render:RGraph{fw_stamp:Default::default(),qstate:Default::default(),qinfo:Default::default(),notifier:Object::default()}},
-        engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true,completed:2}}},claims:Claims{slot:[0;16],slot_count:u32::from(!render),pass:[0]},head:1,ta_head:1,fs_head:1,rec:[1;3],pb_slot:0,uma_submitted:2,csubmitted:{let mut a=[0u64;16];if !render{a[0]=ordinal;}a},recovery_suspect:false,recovery_started_ns:0,doomed:false}],target,ta_target:target,fs_target:target,retired_ticks:[0;4]},
+        engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true,completed:2}}},claims:Claims{slot:[0;16],slot_count:u32::from(!render),pass:[0;4]},head:1,ta_head:1,fs_head:1,rec:[1;3],pb_slot:0,uma_submitted:2,csubmitted:{let mut a=[0u64;16];if !render{a[0]=ordinal;}a},stage_ts_mask:u64::from(render),recovery_suspect:false,recovery_started_ns:0,doomed:false}],target,ta_target:target,fs_target:target,retired_ticks:[0;4]},
         slots:Slots{scrub:Scrub{compute:vec![CUnit{counter:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}]}},
         pools:Pools{full:true,completed:2},queue_passed:true,
     };
@@ -291,6 +292,81 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     fmix.engine.flights.remove(1);
     assert_eq!(fmix.retired_flight_classes(&mut check_c,&mut check_r),Ok(None));
     assert_eq!(fmix.graph.compute.fw_stamp.reads.get(),1);
+}
+#[test]fn timestamp_free_render_retires_without_scene_wc_reads(){
+    // Timestamp-free render (stage_ts_mask == 0) authenticates on fw_stamp, queue_receipt,
+    // notifier, and pb_retired without touching scene WC cells even when scene holds zeros.
+    let mut f=firmware(true,15);
+    f.engine.flights[0].stage_ts_mask=0;
+    f.engine.flights[0].job.resources.passes[0].scene=Object::default();
+    assert_eq!(f.retired_flight(),Ok(Some((0,Retirement::Full))));
+    assert_eq!(f.engine.flights[0].job.resources.passes[0].scene.reads.get(),0);
+    assert_eq!(f.engine.retired_ticks,[0;4]);
+    // Still rejects missing pb_retired, notifier, queue_receipt, or fw_stamp.
+    f.engine.flights[0].job.resources.pools.full=false;
+    assert_eq!(f.retired_flight(),Ok(None));
+    f.engine.flights[0].job.resources.pools.full=true;
+    f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(14)));
+    assert_eq!(f.retired_flight(),Ok(None));
+    f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(15)));
+    f.queue_passed=false;
+    assert_eq!(f.retired_flight(),Ok(None));
+    f.queue_passed=true;
+    f.graph.render.fw_stamp[0].set(0,u64::from(encode::stamp(14)));
+    assert_eq!(f.retired_flight(),Ok(None));
+    f.graph.render.fw_stamp[0].set(0,u64::from(encode::stamp(15)));
+    assert_eq!(f.retired_flight(),Ok(Some((0,Retirement::Full))));
+    assert_eq!(f.engine.flights[0].job.resources.passes[0].scene.reads.get(),0);
+
+    // Mixed multi-pass flight (pass 0 timestamp-free, pass 1 timestamped): only pass 1 is read.
+    let mut fm=firmware(true,20);
+    let fl=&mut fm.engine.flights[0];
+    fl.renders=2;
+    fl.claims.pass=[0,1,0,0];
+    fl.stage_ts_mask=1<<1;
+    let mut p1=RUnit{scene:Object::default()};
+    for (off,t) in [(0x600,200),(0x608,210),(0x620,220),(0x628,230)] { p1.scene.set(off,t); }
+    fl.job.resources.passes=vec![RUnit{scene:Object::default()},p1];
+    assert_eq!(fm.retired_flight(),Ok(Some((0,Retirement::Full))));
+    assert_eq!(fm.engine.flights[0].job.resources.passes[0].scene.reads.get(),0);
+    assert_eq!(fm.engine.flights[0].job.resources.passes[1].scene.reads.get(),4);
+    // Missing timestamp on timestamped pass 1 keeps the mixed flight pending.
+    fm.engine.flights[0].job.resources.passes[1].scene.set(0x628,0);
+    assert_eq!(fm.retired_flight(),Ok(None));
+}
+#[test]fn recovery_suspect_timestamp_free_render_aborts_after_grace(){
+    // A recovery-suspect render whose microsequence omitted timestamps lacks stage-execution
+    // proof and must NEVER retire as Full even when stamps, queue, notifier, and PB advanced.
+    CLOCK.with(|c|c.set(100_000_000));
+    let mut f=firmware(true,25);
+    f.engine.flights[0].stage_ts_mask=0;
+    f.engine.flights[0].recovery_suspect=true;
+    f.engine.flights[0].recovery_started_ns=90_000_000;
+    // Within 20 ms grace period: remains Pending, not Full and not doomed.
+    assert_eq!(f.retired_flight(),Ok(None));
+    assert!(!f.engine.flights[0].doomed);
+    // Past 20 ms grace period: retires as Aborted and marks flight doomed.
+    CLOCK.with(|c|c.set(110_000_000));
+    assert_eq!(f.retired_flight(),Ok(Some((0,Retirement::Aborted))));
+    assert!(f.engine.flights[0].doomed);
+
+    // Mixed multi-pass suspect flight where pass 0 omitted timestamps and pass 1 emitted them
+    // also lacks full execution proof and aborts after the grace period.
+    CLOCK.with(|c|c.set(100_000_000));
+    let mut fm=firmware(true,26);
+    let fl=&mut fm.engine.flights[0];
+    fl.renders=2;
+    fl.claims.pass=[0,1,0,0];
+    fl.stage_ts_mask=1<<1;
+    fl.recovery_suspect=true;
+    fl.recovery_started_ns=90_000_000;
+    let mut p1=RUnit{scene:Object::default()};
+    for (off,t) in [(0x600,200),(0x608,210),(0x620,220),(0x628,230)] { p1.scene.set(off,t); }
+    fl.job.resources.passes=vec![RUnit{scene:Object::default()},p1];
+    assert_eq!(fm.retired_flight(),Ok(None));
+    CLOCK.with(|c|c.set(110_000_000));
+    assert_eq!(fm.retired_flight(),Ok(Some((0,Retirement::Aborted))));
+    assert!(fm.engine.flights[0].doomed);
 }
 
 '''.replace('__LOGIC__', str(backend/'recovery/logic.rs'))

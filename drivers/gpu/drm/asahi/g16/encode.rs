@@ -279,6 +279,7 @@ pub(crate) fn barrier(
 mod render_encoder;
 #[allow(unused_imports)] // Includes private-tail variants rejected by the shared Mesa UAPI.
 pub(crate) use render_encoder::{
-    append_fs_timestamp_copies, encode_fs, encode_fs_for, encode_ta, encode_ta_for, fill_scene,
-    initbm, render_attachments, scene, scene_render, PassRefs, RenderRefs,
+    append_fs_timestamp_copies, encode_fs, encode_fs_for, encode_fs_with_timestamps, encode_ta,
+    encode_ta_for, encode_ta_with_timestamps, fill_scene, initbm, render_attachments,
+    render_attachments_with, scene, scene_render, PassRefs, RenderRefs,
 };

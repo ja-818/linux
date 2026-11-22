@@ -1065,6 +1065,16 @@ impl Firmware {
             if full {
                 let count = (f.renders as usize).min(f.claims.pass.len());
                 for m in 0..count {
+                    if f.stage_ts_mask & (1u64 << m) == 0 {
+                        if f.recovery_suspect {
+                            // Without microsequence timestamps, a recovery-suspect render lacks
+                            // stage-execution proof to distinguish normal completion from a
+                            // firmware-aborted pass that still advanced stamps/notifier/PB.
+                            full = false;
+                            break;
+                        }
+                        continue;
+                    }
                     let k = f.claims.pass[m] as usize;
                     let unit = f.job.resources.render_pass(k)?;
                     let ta_start = unit.scene.r64(0x600)?;
@@ -1512,10 +1522,12 @@ impl Firmware {
         let work_ticks = self.init.abi.compute().work_ticks;
         let s = &mut self.engine.stats;
 
+        let mut charged_render = false;
+        let mut charged_compute = false;
         let mut add_interval =
-            |start: u64, end: u64, sum: &mut u64, engine: crate::usage::Engine| {
+            |start: u64, end: u64, sum: &mut u64, engine: crate::usage::Engine| -> bool {
                 if start == 0 || end < start {
-                    return;
+                    return false;
                 }
                 f.job
                     .queue
@@ -1524,22 +1536,23 @@ impl Firmware {
                 *sum = sum.saturating_add(end - start);
                 lo = lo.min(start);
                 hi = hi.max(end);
+                true
             };
         if f.renders == 1 && f.computes == 0 && ticks[0] != 0 {
-            add_interval(
+            charged_render |= add_interval(
                 ticks[0],
                 ticks[1],
                 &mut s.ta_ticks,
                 crate::usage::Engine::Vertex,
             );
-            add_interval(
+            charged_render |= add_interval(
                 ticks[2],
                 ticks[3],
                 &mut s.fs_ticks,
                 crate::usage::Engine::Fragment,
             );
         } else if f.computes == 1 && f.renders == 0 && ticks[0] != 0 {
-            add_interval(
+            charged_compute |= add_interval(
                 ticks[0],
                 ticks[1],
                 &mut s.cdm_ticks,
@@ -1550,27 +1563,31 @@ impl Firmware {
             let mut stage = |o: &super::object::FwObject,
                              off: usize,
                              sum: &mut u64,
-                             engine: crate::usage::Engine| {
+                             engine: crate::usage::Engine|
+             -> bool {
                 let (Ok(start_lo), Ok(start_hi), Ok(end_lo), Ok(end_hi)) =
                     (o.r32(off), o.r32(off + 4), o.r32(off + 8), o.r32(off + 12))
                 else {
-                    return;
+                    return false;
                 };
                 let start = u64::from(start_hi) << 32 | u64::from(start_lo);
                 let end = u64::from(end_hi) << 32 | u64::from(end_lo);
-                add_interval(start, end, sum, engine);
+                add_interval(start, end, sum, engine)
             };
             for k in 0..f.renders as usize {
+                if f.stage_ts_mask & (1u64 << k) == 0 {
+                    continue;
+                }
                 let Ok(p) = f.job.resources.render_pass(f.claims.pass[k] as usize) else {
                     return;
                 };
-                stage(
+                charged_render |= stage(
                     &p.scene,
                     0x600,
                     &mut s.ta_ticks,
                     crate::usage::Engine::Vertex,
                 );
-                stage(
+                charged_render |= stage(
                     &p.scene,
                     0x620,
                     &mut s.fs_ticks,
@@ -1582,7 +1599,39 @@ impl Firmware {
                     return;
                 };
                 if let Ok((start, end)) = Self::compute_ticks_with(work_ticks, c) {
-                    add_interval(start, end, &mut s.cdm_ticks, crate::usage::Engine::Compute);
+                    charged_compute |=
+                        add_interval(start, end, &mut s.cdm_ticks, crate::usage::Engine::Compute);
+                }
+            }
+        }
+        // When firmware timestamps were omitted for an engine class, fall back to the host
+        // 24 MHz counter (`CNTPCT_EL0`, matching firmware's clock domain) from publication to
+        // retirement so DRM fdinfo engine-time counters remain active without WC reads;
+        // `usage::Lane` deduplicates overlapping pipelined flights on the same queue.
+        if (f.renders != 0 && !charged_render) || (f.computes != 0 && !charged_compute) {
+            let end = super::engine::counter_ticks();
+            if f.published_ticks != 0 && end > f.published_ticks {
+                if f.renders != 0 && !charged_render {
+                    add_interval(
+                        f.published_ticks,
+                        end,
+                        &mut s.ta_ticks,
+                        crate::usage::Engine::Vertex,
+                    );
+                    add_interval(
+                        f.published_ticks,
+                        end,
+                        &mut s.fs_ticks,
+                        crate::usage::Engine::Fragment,
+                    );
+                }
+                if f.computes != 0 && !charged_compute {
+                    add_interval(
+                        f.published_ticks,
+                        end,
+                        &mut s.cdm_ticks,
+                        crate::usage::Engine::Compute,
+                    );
                 }
             }
         }

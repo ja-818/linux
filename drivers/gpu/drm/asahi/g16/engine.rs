@@ -291,8 +291,10 @@ pub(crate) struct Flight {
     pub(crate) uma_submitted: u64,
     pub(crate) recovery_suspect: bool,
     pub(crate) recovery_started_ns: u64,
-    /// Publication time, ns.
+    /// Publication time, ns, and 24 MHz host counter tick (`CNTPCT_EL0`) for fdinfo fallback
+    /// when firmware microsequence timestamps are omitted.
     pub(crate) published_ns: u64,
+    pub(crate) published_ticks: u64,
     /// Published behind another flight.
     pub(crate) behind: bool,
     /// The PB epoch this render prefix uses (its own, or a reused allocator-slot epoch).
@@ -305,6 +307,8 @@ pub(crate) struct Flight {
     pub(crate) initbm: bool,
     /// Whether this flight publishes CPU-written command timestamps on retirement.
     pub(crate) has_timestamps: bool,
+    /// Bit `m` is set iff render member `m` emitted firmware microsequence timestamp opcodes.
+    pub(crate) stage_ts_mask: u64,
 }
 
 impl Flight {
@@ -337,12 +341,14 @@ impl Flight {
             recovery_suspect: false,
             recovery_started_ns: 0,
             published_ns: 0,
+            published_ticks: 0,
             behind: false,
             pb: None,
             pb_slot: 0,
             pb_binding: 0,
             initbm: false,
             has_timestamps: false,
+            stage_ts_mask: 0,
         }
     }
 }
@@ -2335,7 +2341,12 @@ impl Firmware {
             )?;
             (refs, false)
         };
+        let emit_ts = !cmd.timestamp_outputs.is_empty()
+            || crate::debug::debug_enabled(crate::debug::DebugFlags::Debug1);
         f.has_timestamps |= !cmd.timestamp_outputs.is_empty();
+        if emit_ts {
+            f.stage_ts_mask |= 1u64 << member;
+        }
         let p = job.resources.render_pass(k)?;
         let pass = p.refs();
         geometry.layer_metadata = pass.heap_gva + if cmd.cmd.layers > 1 { 0x200 } else { 0 };
@@ -2343,7 +2354,7 @@ impl Firmware {
         job.resources
             .set_pass_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes)?;
         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
-        encode::encode_ta_for(
+        let ta_seq_len = encode::encode_ta_with_timestamps(
             self.init.abi.ta(),
             &refs,
             &pass,
@@ -2353,10 +2364,11 @@ impl Firmware {
             target,
             &geometry,
             None,
+            emit_ts,
             image(&mut scratch.ta)?,
             image(&mut scratch.tas)?,
         );
-        encode::encode_fs_for(
+        let fs_seq_len = encode::encode_fs_with_timestamps(
             self.init.abi.fs(),
             &refs,
             &pass,
@@ -2367,11 +2379,17 @@ impl Firmware {
             draw,
             target,
             &geometry,
+            emit_ts,
             image(&mut scratch.fs)?,
             &mut scratch.fss[..],
         );
-        encode::render_attachments(&mut scratch.tas[..], 0, &cmd.vertex_attachments);
-        encode::render_attachments(&mut scratch.fss[..], 1, &cmd.fragment_attachments);
+        encode::render_attachments_with(&mut scratch.tas[..], 0, &cmd.vertex_attachments, emit_ts);
+        encode::render_attachments_with(
+            &mut scratch.fss[..],
+            1,
+            &cmd.fragment_attachments,
+            emit_ts,
+        );
         encode::fill_scene(&refs, &pass, &mut scratch.scene[..]);
         encode::scene_render(
             &refs,
@@ -2399,8 +2417,8 @@ impl Firmware {
                 &scratch.fs[work::fs::TAIL_ACTIVE_START..],
             )?;
         }
-        p.ta_seq.write(0, &scratch.tas[..])?;
-        p.fs_seq.write(0, &scratch.fss[..])?;
+        p.ta_seq.write(0, &scratch.tas[..ta_seq_len])?;
+        p.fs_seq.write(0, &scratch.fss[..fs_seq_len])?;
         p.scene.write(0, &scratch.scene[..])?;
         // One retained descriptor is shared by TA and FS; its private submitted counter
         // advances by two per pass. Reused descriptors and their pool/list bytes remain intact.
@@ -2538,6 +2556,7 @@ impl Firmware {
         let s = &mut self.engine.stats;
         s.pub_ns = now_ns();
         f.published_ns = s.pub_ns;
+        f.published_ticks = counter_ticks();
         if f.behind {
             s.behind += 1;
             s.overlaps += 1;

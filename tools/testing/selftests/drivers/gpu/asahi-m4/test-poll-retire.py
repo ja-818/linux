@@ -936,7 +936,263 @@ mod resnap_sync_test {
         }
     }
 }
+
+#[path = "__USAGE__"]
+mod usage;
+
+mod stat_retire_scope {
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    struct Error(i32);
+    const EINVAL: Error = Error(22);
+    type Result<T = ()> = std::result::Result<T, Error>;
+
+    thread_local! {
+        static NOW_NS: Cell<u64> = const { Cell::new(0) };
+        static TICKS: Cell<u64> = const { Cell::new(0) };
+    }
+    fn now_ns() -> u64 {
+        NOW_NS.with(|c| c.get())
+    }
+
+    mod engine {
+        pub(crate) fn counter_ticks() -> u64 {
+            super::TICKS.with(|c| c.get())
+        }
+    }
+    mod hw {
+        pub(crate) const COMMAND_TIMESTAMP_HZ: u64 = 24_000_000;
+    }
+    mod object {
+        use super::{Cell, BTreeMap, Result};
+        #[derive(Default)]
+        pub(crate) struct FwObject {
+            cells: BTreeMap<usize, u32>,
+            pub(crate) reads: Cell<u32>,
+        }
+        impl FwObject {
+            pub(crate) fn set_u64(&mut self, off: usize, v: u64) {
+                self.cells.insert(off, v as u32);
+                self.cells.insert(off + 4, (v >> 32) as u32);
+            }
+            pub(crate) fn r32(&self, off: usize) -> Result<u32> {
+                self.reads.set(self.reads.get() + 1);
+                Ok(*self.cells.get(&off).unwrap_or(&0))
+            }
+            pub(crate) fn r64(&self, off: usize) -> Result<u64> {
+                let lo = self.r32(off)?;
+                let hi = self.r32(off + 4)?;
+                Ok(u64::from(lo) | (u64::from(hi) << 32))
+            }
+        }
+    }
+
+    struct ComputeSlot {
+        its: object::FwObject,
+    }
+    struct PassSlot {
+        scene: object::FwObject,
+    }
+    struct Resources {
+        passes: Vec<PassSlot>,
+        compute: Vec<ComputeSlot>,
+    }
+    impl Resources {
+        fn render_pass(&self, k: usize) -> Result<&PassSlot> {
+            self.passes.get(k).ok_or(EINVAL)
+        }
+        fn compute_unit(&self, k: usize) -> Result<&ComputeSlot> {
+            self.compute.get(k).ok_or(EINVAL)
+        }
+    }
+    struct Queue {
+        usage: crate::usage::Lane<Arc<crate::usage::Client>>,
+    }
+    struct Job {
+        queue: Queue,
+        resources: Resources,
+    }
+    struct Claims {
+        pass: [u32; 8],
+        slot: [u32; 8],
+        slot_count: u32,
+    }
+    struct Flight {
+        job: Job,
+        claims: Claims,
+        computes: u32,
+        renders: u32,
+        count: usize,
+        published_ns: u64,
+        published_ticks: u64,
+        stage_ts_mask: u64,
+    }
+    #[derive(Default)]
+    struct Stats {
+        ta_ticks: u64,
+        fs_ticks: u64,
+        cdm_ticks: u64,
+        span_ticks: u64,
+        first_ns: [u64; 3],
+        last_ns: [u64; 3],
+        count: [u64; 3],
+        prefixes: [u64; 3],
+        busy_ns: [u64; 3],
+        max_ns: [u64; 3],
+    }
+    struct ComputeAbi {
+        work_ticks: Option<(usize, usize)>,
+    }
+    struct Abi;
+    impl Abi {
+        fn compute(&self) -> ComputeAbi {
+            ComputeAbi { work_ticks: None }
+        }
+    }
+    struct Init {
+        abi: Abi,
+    }
+    struct Engine {
+        stats: Stats,
+    }
+    struct Events {
+        event_ns: [u64; 3],
+    }
+    struct Firmware {
+        init: Init,
+        engine: Engine,
+        events: Events,
+    }
+    impl Firmware {
+        fn new() -> Self {
+            Self {
+                init: Init { abi: Abi },
+                engine: Engine {
+                    stats: Stats::default(),
+                },
+                events: Events { event_ns: [0; 3] },
+            }
+        }
+        fn compute_ticks_with(
+            _work_ticks: Option<(usize, usize)>,
+            unit: &ComputeSlot,
+        ) -> Result<(u64, u64)> {
+            Ok((unit.its.r64(0)?, unit.its.r64(8)?))
+        }
+
+        __STAT_RETIRE__
+    }
+
+    fn mk_render_flight(
+        client: &Arc<crate::usage::Client>,
+        renders: u32,
+        stage_ts_mask: u64,
+        published_ticks: u64,
+    ) -> Flight {
+        let mut passes = Vec::new();
+        for _ in 0..renders {
+            passes.push(PassSlot {
+                scene: object::FwObject::default(),
+            });
+        }
+        let mut pass = [0u32; 8];
+        for i in 0..renders as usize {
+            pass[i] = i as u32;
+        }
+        Flight {
+            job: Job {
+                queue: Queue {
+                    usage: crate::usage::Lane::new(client.clone()),
+                },
+                resources: Resources {
+                    passes,
+                    compute: vec![],
+                },
+            },
+            claims: Claims {
+                pass,
+                slot: [0; 8],
+                slot_count: 0,
+            },
+            computes: 0,
+            renders,
+            count: renders as usize,
+            published_ns: 1_000,
+            published_ticks,
+            stage_ts_mask,
+        }
+    }
+
+    #[test]
+    fn timestamp_free_render_charges_fdinfo_via_host_counter_without_wc_reads() {
+        NOW_NS.with(|c| c.set(100_000));
+        // 24,000 ticks at 24 MHz = 1,000,000 ns (1 ms).
+        TICKS.with(|c| c.set(1_024_000));
+        let client = Arc::new(crate::usage::Client::new());
+        let mut fw = Firmware::new();
+        let f = mk_render_flight(&client, 1, 0, 1_000_000);
+        fw.stat_retire(&f, [0; 4]);
+        assert_eq!(f.job.resources.passes[0].scene.reads.get(), 0);
+        assert_eq!(client.snapshot(), [1_000_000, 1_000_000, 0]);
+        assert_eq!(fw.engine.stats.ta_ticks, 24_000);
+        assert_eq!(fw.engine.stats.fs_ticks, 24_000);
+        assert_eq!(fw.engine.stats.span_ticks, 24_000);
+    }
+
+    #[test]
+    fn overlapping_timestamp_free_renders_charge_exact_union_per_queue() {
+        NOW_NS.with(|c| c.set(200_000));
+        let client = Arc::new(crate::usage::Client::new());
+        let mut fw = Firmware::new();
+        // Share one Lane across two overlapping pipelined renders: [1_000_000..1_024_000]
+        // and [1_012_000..1_036_000] => union is 36,000 ticks = 1,500,000 ns.
+        let mut f1 = mk_render_flight(&client, 1, 0, 1_000_000);
+        TICKS.with(|c| c.set(1_024_000));
+        fw.stat_retire(&f1, [0; 4]);
+        f1.published_ticks = 1_012_000;
+        TICKS.with(|c| c.set(1_036_000));
+        fw.stat_retire(&f1, [0; 4]);
+        assert_eq!(client.snapshot(), [1_500_000, 1_500_000, 0]);
+    }
+
+    #[test]
+    fn multi_pass_timestamp_free_and_timestamped_renders_keep_exact_accounting() {
+        NOW_NS.with(|c| c.set(300_000));
+        // Multi-pass timestamp-free flight (3 passes, stage_ts_mask == 0): zero scene reads,
+        // host fallback charges 48,000 ticks = 2,000,000 ns.
+        let client = Arc::new(crate::usage::Client::new());
+        let mut fw = Firmware::new();
+        let f_multi = mk_render_flight(&client, 3, 0, 2_000_000);
+        TICKS.with(|c| c.set(2_048_000));
+        fw.stat_retire(&f_multi, [0; 4]);
+        for p in &f_multi.job.resources.passes {
+            assert_eq!(p.scene.reads.get(), 0);
+        }
+        assert_eq!(client.snapshot(), [2_000_000, 2_000_000, 0]);
+
+        // Timestamped single-pass flight uses hardware ticks rather than host fallback.
+        let client2 = Arc::new(crate::usage::Client::new());
+        let mut fw2 = Firmware::new();
+        let f_ts = mk_render_flight(&client2, 1, 1, 2_000_000);
+        TICKS.with(|c| c.set(2_240_000));
+        // Hardware TA = 2400 ticks (100 us), FS = 4800 ticks (200 us).
+        fw2.stat_retire(&f_ts, [2_001_000, 2_003_400, 2_003_400, 2_008_200]);
+        assert_eq!(client2.snapshot(), [100_000, 200_000, 0]);
+    }
+}
 '''
+
+harness = harness.replace('__USAGE__', str(production.parent.parent / 'usage.rs'))
+harness = harness.replace(
+    '__STAT_RETIRE__',
+    item('fn stat_retire(')
+    .replace('super::engine::', 'engine::')
+    .replace('super::hw::', 'hw::')
+    .replace('super::object::', 'object::'),
+)
 
 for token, decl in {
     '__SUBMIT_LOCKED__': 'fn submit_locked(',

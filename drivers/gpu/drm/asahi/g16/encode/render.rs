@@ -157,8 +157,8 @@ pub(crate) fn encode_ta(
 }
 
 /// Encode the 66-record single-cluster tiler work of `layout`'s ABI and its exact 0x300
-/// sequence.
-#[allow(clippy::too_many_arguments)]
+/// sequence (including start/end timestamp opcodes).
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn encode_ta_for(
     layout: &ta::Layout,
     r: &RenderRefs,
@@ -168,10 +168,31 @@ pub(crate) fn encode_ta_for(
     ctx: u32,
     target: u32,
     geo: &Geometry,
-    _cl: Option<&ClusterLayout>,
+    cl: Option<&ClusterLayout>,
     w: &mut [u8; ta::WORK_SIZE],
     q: &mut [u8; ta::SEQ_SIZE],
 ) {
+    let _ = encode_ta_with_timestamps(layout, r, p, u, ts_va, ctx, target, geo, cl, true, w, q);
+}
+
+/// Encode the 66-record single-cluster tiler work of `layout`'s ABI and its microsequence,
+/// returning the active byte length (`ta::SEQ_SIZE` with timestamps, `ta::SEQ_SIZE_NOTS`
+/// when start/end timestamp opcodes are omitted).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_ta_with_timestamps(
+    layout: &ta::Layout,
+    r: &RenderRefs,
+    p: &PassRefs,
+    u: &uapi::drm_asahi_cmd_render,
+    ts_va: &[u64; 4],
+    ctx: u32,
+    target: u32,
+    geo: &Geometry,
+    _cl: Option<&ClusterLayout>,
+    emit_timestamps: bool,
+    w: &mut [u8; ta::WORK_SIZE],
+    q: &mut [u8; ta::SEQ_SIZE],
+) -> usize {
     w.fill(0);
     q.fill(0);
     let scratch = p.scene_user_gva;
@@ -264,8 +285,13 @@ pub(crate) fn encode_ta_for(
     put16(w, 0x74a, 66 * 12);
     put64(w, 0x760, p.tpc_fw);
     put64(w, ta::TPC_BYTES, geo.tpc_bytes);
+    let seq_size = if emit_timestamps {
+        ta::SEQ_SIZE
+    } else {
+        ta::SEQ_SIZE_NOTS
+    };
     put64(w, 0x770, p.ta_seq);
-    put32(w, 0x778, ta::SEQ_SIZE as u32);
+    put32(w, 0x778, seq_size as u32);
     put32(w, 0x77c, 0x71);
     put32(w, 0x780, target);
     put64(w, 0x7a8, compact(p.pre_gva[0]));
@@ -292,17 +318,23 @@ pub(crate) fn encode_ta_for(
     put32(q, 0x7c, r.uuid);
     // TA attachments are filled by render_attachments before publication.
     inline_uma(q, 0x190, r, 0);
-    timestamps(
-        q,
-        0x1cc,
-        work,
-        r.qinfo[0],
-        ts_va[0] != 0 || ts_va[1] != 0,
-        r.uuid,
-        0,
-        layout.auxiliary,
-    );
-    let f = 0x268;
+    let f = if emit_timestamps {
+        timestamps(
+            q,
+            ta::TS_START,
+            work,
+            r.qinfo[0],
+            ts_va[0] != 0 || ts_va[1] != 0,
+            r.uuid,
+            0,
+            layout.auxiliary,
+        );
+        ta::FINALIZE
+    } else {
+        // Keep WaitForIdle (opcode 1) between TA_START/inline_uma and TA_FINALIZE.
+        put32(q, ta::TS_START, 1);
+        ta::FINALIZE_NOTS
+    };
     put32(q, f, 6);
     put64(q, f + 4, p.scene);
     put64(q, f + 0xc, r.pb_mgr);
@@ -319,6 +351,7 @@ pub(crate) fn encode_ta_for(
     put64(q, f + 0x85, work + layout.completion as u64);
     put8(q, f + 0x8d, 1);
     put32(q, f + 0x94, 0x40000002);
+    seq_size
 }
 
 /// Encode the 25G83 82-record fragment work and base 0x380 sequence.
@@ -339,9 +372,33 @@ pub(crate) fn encode_fs(
     encode_fs_for(&fs::V25G83, r, p, u, ts_va, ctx, usc, n, target, geo, w, q)
 }
 
-/// Encode the 82-record fragment work of `layout`'s ABI and base 0x380 sequence.
-#[allow(clippy::too_many_arguments)]
+/// Encode the 82-record fragment work of `layout`'s ABI and base 0x380 sequence
+/// (including start/end timestamp opcodes).
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn encode_fs_for(
+    layout: &fs::Layout,
+    r: &RenderRefs,
+    p: &PassRefs,
+    u: &uapi::drm_asahi_cmd_render,
+    ts_va: &[u64; 4],
+    ctx: u32,
+    usc: u64,
+    n: u64,
+    target: u32,
+    geo: &Geometry,
+    w: &mut [u8; fs::WORK_SIZE],
+    q: &mut [u8],
+) {
+    let _ = encode_fs_with_timestamps(
+        layout, r, p, u, ts_va, ctx, usc, n, target, geo, true, w, q,
+    );
+}
+
+/// Encode the 82-record fragment work of `layout`'s ABI and its microsequence, returning
+/// the active byte length (`fs::SEQ_SIZE` with timestamps, `fs::SEQ_SIZE_NOTS` when
+/// start/end timestamp opcodes are omitted).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_fs_with_timestamps(
     layout: &fs::Layout,
     r: &RenderRefs,
     p: &PassRefs,
@@ -352,9 +409,10 @@ pub(crate) fn encode_fs_for(
     _n: u64,
     target: u32,
     geo: &Geometry,
+    emit_timestamps: bool,
     w: &mut [u8; fs::WORK_SIZE],
     q: &mut [u8],
-) {
+) -> usize {
     w.fill(0);
     q.fill(0);
     let val: [u64; 82] = [
@@ -445,8 +503,13 @@ pub(crate) fn encode_fs_for(
     put32(w, 0, 1);
     put64(w, 4, r.counter[1]);
     put32(w, 0xc, ctx);
+    let seq_size = if emit_timestamps {
+        fs::SEQ_SIZE
+    } else {
+        fs::SEQ_SIZE_NOTS
+    };
     put64(w, 0x14, p.fs_seq);
-    put32(w, 0x1c, fs::SEQ_SIZE as u32);
+    put32(w, 0x1c, seq_size as u32);
     put64(w, 0x20, r.notifier + 0x200);
     put64(w, 0x28, r.pb_mgr);
     put64(w, 0x30, p.scene);
@@ -535,17 +598,23 @@ pub(crate) fn encode_fs_for(
     put64(q, 0x84, work + 0xbf0);
     put32(q, 0xa0, r.uuid);
     inline_uma(q, 0x1b0, r, 1);
-    timestamps(
-        q,
-        0x1ec,
-        work,
-        r.qinfo[1],
-        ts_va[2] != 0 || ts_va[3] != 0,
-        r.uuid,
-        1,
-        layout.auxiliary,
-    );
-    let f = 0x288;
+    let f = if emit_timestamps {
+        timestamps(
+            q,
+            fs::TS_START,
+            work,
+            r.qinfo[1],
+            ts_va[2] != 0 || ts_va[3] != 0,
+            r.uuid,
+            1,
+            layout.auxiliary,
+        );
+        fs::FINALIZE
+    } else {
+        // Keep WaitForIdle (opcode 1) between FS_START/inline_uma and FS_FINALIZE.
+        put32(q, fs::TS_START, 1);
+        fs::FINALIZE_NOTS
+    };
     put32(q, f, 8);
     put32(q, f + 4, r.uuid);
     put64(q, f + 0xc, r.fw_stamp[1]);
@@ -568,11 +637,24 @@ pub(crate) fn encode_fs_for(
     put8(q, f + 0xb1, 1);
     put32(q, f + 0xb2, 0x71);
     put32(q, f + 0xbc, 0x40000002);
+    seq_size
 }
 
 /// Complete attachment blocks include the count at the last word. The scheduler
 /// has validated full retained ranges; alignment is for firmware cache lines.
+#[allow(dead_code)]
 pub(crate) fn render_attachments(q: &mut [u8], engine: usize, att: &[uapi::drm_asahi_attachment]) {
+    render_attachments_with(q, engine, att, true);
+}
+
+/// Complete attachment blocks for either the full (`emit_timestamps = true`) or compact
+/// timestamp-free (`emit_timestamps = false`) render microsequence.
+pub(crate) fn render_attachments_with(
+    q: &mut [u8],
+    engine: usize,
+    att: &[uapi::drm_asahi_attachment],
+    emit_timestamps: bool,
+) {
     let base = if engine == 0 { 0x88 } else { 0xa8 };
     for (i, a) in att.iter().enumerate().take(16) {
         let start = a.pointer & !127;
@@ -585,9 +667,17 @@ pub(crate) fn render_attachments(q: &mut [u8], engine: usize, att: &[uapi::drm_a
     }
     put32(q, base + 0x100, att.len().min(16) as u32);
     let f = if engine == 0 {
-        ta::FINALIZE + 0x84
+        (if emit_timestamps {
+            ta::FINALIZE
+        } else {
+            ta::FINALIZE_NOTS
+        }) + 0x84
     } else {
-        fs::FINALIZE + 0xa4
+        (if emit_timestamps {
+            fs::FINALIZE
+        } else {
+            fs::FINALIZE_NOTS
+        }) + 0xa4
     };
     put8(q, f, u8::from(!att.is_empty()));
 }

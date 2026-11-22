@@ -71,6 +71,7 @@ pub(crate) mod ta {
     pub(crate) const HEAD_ACTIVE_SIZE: usize = 0x360;
     pub(crate) const TAIL_ACTIVE_START: usize = 0x740;
     pub(crate) const SEQ_SIZE: usize = 0x300;
+    pub(crate) const SEQ_SIZE_NOTS: usize = 0x268;
     pub(crate) const SEQ_OBJECT: usize = 0x1000;
     pub(crate) const REGS: usize = 0x40;
     pub(crate) const TAIL: usize = 0x8c0;
@@ -79,7 +80,9 @@ pub(crate) mod ta {
     pub(crate) const TS_START: usize = 0x1cc;
     pub(crate) const TS_END: usize = 0x21c;
     pub(crate) const FINALIZE: usize = 0x268;
+    pub(crate) const FINALIZE_NOTS: usize = 0x1d0;
     pub(crate) const END: usize = 0x2fc;
+    pub(crate) const END_NOTS: usize = 0x264;
     /// The binding generation.
     pub(crate) const GENERATION: usize = 0x917;
 
@@ -112,6 +115,9 @@ pub(crate) mod ta {
             && l.auxiliary + 8 <= WORK_SIZE
     }
     const _: () = assert!(valid(&V25G83) && valid(&V26B123));
+    const _: () = assert!(FINALIZE_NOTS == TS_START + 4);
+    const _: () = assert!(END_NOTS == FINALIZE_NOTS + (END - FINALIZE));
+    const _: () = assert!(SEQ_SIZE_NOTS == END_NOTS + 4 && SEQ_SIZE_NOTS <= SEQ_SIZE);
     const _: () = assert!(REGS + SEL.len() * super::REG_RECORD <= HEAD_ACTIVE_SIZE);
     const _: () = assert!(HEAD_ACTIVE_SIZE <= TAIL_ACTIVE_START);
     const _: () = assert!(TAIL_ACTIVE_START <= WORK_SIZE);
@@ -135,13 +141,16 @@ pub(crate) mod fs {
     pub(crate) const HEAD_ACTIVE_SIZE: usize = 0x460;
     pub(crate) const TAIL_ACTIVE_START: usize = 0x780;
     pub(crate) const SEQ_SIZE: usize = 0x380;
+    pub(crate) const SEQ_SIZE_NOTS: usize = 0x2b0;
     pub(crate) const SEQ_OBJECT: usize = 0x1000;
     pub(crate) const REGS: usize = 0x80;
     pub(crate) const TAIL: usize = 0xc08;
     pub(crate) const TS_START: usize = 0x1ec;
     pub(crate) const TS_END: usize = 0x23c;
     pub(crate) const FINALIZE: usize = 0x288;
+    pub(crate) const FINALIZE_NOTS: usize = 0x1f0;
     pub(crate) const END: usize = 0x344;
+    pub(crate) const END_NOTS: usize = 0x2ac;
     /// The binding generation.
     pub(crate) const GENERATION: usize = 0xc5f;
 
@@ -179,6 +188,9 @@ pub(crate) mod fs {
             && l.flag < WORK_SIZE
     }
     const _: () = assert!(valid(&V25G83) && valid(&V26B123));
+    const _: () = assert!(FINALIZE_NOTS == TS_START + 4);
+    const _: () = assert!(END_NOTS == FINALIZE_NOTS + (END - FINALIZE));
+    const _: () = assert!(SEQ_SIZE_NOTS == END_NOTS + 4 && SEQ_SIZE_NOTS <= SEQ_SIZE);
     const _: () = assert!(REGS + SEL.len() * super::REG_RECORD <= HEAD_ACTIVE_SIZE);
     const _: () = assert!(HEAD_ACTIVE_SIZE <= TAIL_ACTIVE_START);
     const _: () = assert!(TAIL_ACTIVE_START <= WORK_SIZE);

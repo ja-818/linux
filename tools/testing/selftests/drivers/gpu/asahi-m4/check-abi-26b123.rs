@@ -219,6 +219,66 @@ fn render(out: &std::path::Path) {
         let mut all = tw.to_vec(); all.extend(tq); all.extend(fw_); all.extend(fq);
         std::fs::write(out.join(format!("render-{name}.bin")), all).unwrap();
     }
+    // Compact timestamp-free render microsequences keep WaitForIdle (1), rebase FINALIZE and
+    // its negative restart branch offset, write has_attachments at FINALIZE_NOTS, terminate
+    // with END (0x40000002), and advertise exact SEQ_SIZE_NOTS in the work images.
+    let att = [uapi::drm_asahi_attachment {
+        pointer: g + 0x50000000,
+        size: 137,
+        ..Default::default()
+    }];
+    for (ta_layout, fs_layout) in [(&ta::V25G83, &fs::V25G83), (&ta::V26B123, &fs::V26B123)] {
+        let mut tw_nots = [0xa5; ta::WORK_SIZE];
+        let mut tq_nots = [0xa5; ta::SEQ_SIZE];
+        let mut fw_nots = [0xa5; fs::WORK_SIZE];
+        let mut fq_nots = [0xa5; fs::SEQ_SIZE];
+        let ta_len = encode::encode_ta_with_timestamps(
+            ta_layout, &r, &p, &u, &[0; 4], 7, 0x300, &geo, None, false, &mut tw_nots, &mut tq_nots,
+        );
+        let fs_len = encode::encode_fs_with_timestamps(
+            fs_layout, &r, &p, &u, &[0; 4], 7, 1 << 40, 1, 0x300, &geo, false, &mut fw_nots,
+            &mut fq_nots,
+        );
+        assert_eq!(ta_len, ta::SEQ_SIZE_NOTS);
+        assert_eq!(fs_len, fs::SEQ_SIZE_NOTS);
+        assert_eq!(r32(&tw_nots, 0x778), ta::SEQ_SIZE_NOTS as u32);
+        assert_eq!(r32(&fw_nots, 0x1c), fs::SEQ_SIZE_NOTS as u32);
+        // WaitForIdle (1) sits immediately after inline_uma; FINALIZE follows directly.
+        assert_eq!(r32(&tq_nots, ta::TS_START), 1);
+        assert_eq!(r32(&tq_nots, ta::FINALIZE_NOTS), 6);
+        assert_eq!(r64(&tq_nots, ta::FINALIZE_NOTS + 0x78), p.ta_seq + 0x190);
+        assert_eq!(
+            r32(&tq_nots, ta::FINALIZE_NOTS + 0x80),
+            0u32.wrapping_sub(ta::FINALIZE_NOTS as u32),
+        );
+        assert_eq!(
+            r64(&tq_nots, ta::FINALIZE_NOTS + 0x85),
+            p.ta_work + ta_layout.completion as u64,
+        );
+        assert_eq!(r32(&tq_nots, ta::END_NOTS), 0x40000002);
+        assert_eq!(r32(&fq_nots, fs::TS_START), 1);
+        assert_eq!(r32(&fq_nots, fs::FINALIZE_NOTS), 8);
+        assert_eq!(r64(&fq_nots, fs::FINALIZE_NOTS + 0x98), p.fs_seq + 0x1b0);
+        assert_eq!(
+            r32(&fq_nots, fs::FINALIZE_NOTS + 0xa0),
+            0u32.wrapping_sub(fs::FINALIZE_NOTS as u32),
+        );
+        assert_eq!(
+            r64(&fq_nots, fs::FINALIZE_NOTS + 0xa5),
+            p.fs_work + fs_layout.completion as u64,
+        );
+        assert_eq!(r32(&fq_nots, fs::END_NOTS), 0x40000002);
+        // Attachments write has_attachments at FINALIZE_NOTS (+0x84 TA / +0xa4 FS) without
+        // disturbing the trailing zero area or the timestamped offset.
+        encode::render_attachments_with(&mut tq_nots, 0, &att, false);
+        encode::render_attachments_with(&mut fq_nots, 1, &att, false);
+        assert_eq!(tq_nots[ta::FINALIZE_NOTS + 0x84], 1);
+        assert_eq!(tq_nots[ta::FINALIZE + 0x84], 0);
+        assert_eq!(fq_nots[fs::FINALIZE_NOTS + 0xa4], 1);
+        assert_eq!(fq_nots[fs::FINALIZE + 0xa4], 0);
+        assert!(tq_nots[ta::SEQ_SIZE_NOTS..].iter().all(|&b| b == 0));
+        assert!(fq_nots[fs::SEQ_SIZE_NOTS..].iter().all(|&b| b == 0));
+    }
 }
 
 fn compute_work(out: &std::path::Path) {
