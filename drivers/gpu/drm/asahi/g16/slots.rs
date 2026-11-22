@@ -374,6 +374,7 @@ pub(crate) struct Claims {
     pub(crate) slot: [u32; sizes::COMPUTE_SLOTS],
     pub(crate) slot_count: u32,
     pub(crate) pass: [u32; sizes::RENDER_SLOTS],
+    pub(crate) pass_count: u32,
     pub(crate) pass_mask: u32,
     #[allow(dead_code)]
     pub(crate) ct: [u32; sizes::RENDER_SLOTS],
@@ -387,6 +388,7 @@ impl Claims {
             slot: [0; sizes::COMPUTE_SLOTS],
             slot_count: 0,
             pass: [0; sizes::RENDER_SLOTS],
+            pass_count: 0,
             pass_mask: 0,
             ct: [0; sizes::RENDER_SLOTS],
             ct_count: 0,
@@ -1127,9 +1129,26 @@ impl Slots {
             || f.slot[..f.slot_count as usize]
                 .iter()
                 .any(|&k| k as usize >= sizes::COMPUTE_UNITS)
+            || f.pass_count as usize > f.pass.len()
             || f.pass_mask & !PASS_MASK != 0
         {
             return Err(EINVAL);
+        }
+        if f.pass_count != 0 {
+            let mut mask = 0u32;
+            for &k in &f.pass[..f.pass_count as usize] {
+                if k as usize >= sizes::RENDER_SLOTS {
+                    return Err(EINVAL);
+                }
+                let bit = 1u32 << k;
+                if mask & bit != 0 {
+                    return Err(EINVAL);
+                }
+                mask |= bit;
+            }
+            if mask != f.pass_mask {
+                return Err(EINVAL);
+            }
         }
         for &k in &f.slot[..f.slot_count as usize] {
             let k = k as usize;
@@ -1174,9 +1193,20 @@ impl Slots {
                 return Err(EBUSY);
             }
         }
-        for k in 0..sizes::RENDER_SLOTS {
-            if f.pass_mask & (1 << k) != 0 && !p.publish(k) {
-                return Err(EBUSY);
+        if f.pass_count != 0 {
+            if f.pass_count as usize > f.pass.len() {
+                return Err(EINVAL);
+            }
+            for &k in &f.pass[..f.pass_count as usize] {
+                if k as usize >= sizes::RENDER_SLOTS || !p.publish(k as usize) {
+                    return Err(EBUSY);
+                }
+            }
+        } else {
+            for k in 0..sizes::RENDER_SLOTS {
+                if f.pass_mask & (1 << k) != 0 && !p.publish(k) {
+                    return Err(EBUSY);
+                }
             }
         }
         self.compute.lifetime = c;
@@ -1192,9 +1222,21 @@ impl Slots {
                 return Err(EINVAL);
             }
         }
-        for k in 0..sizes::RENDER_SLOTS {
-            if f.pass_mask & (1 << k) != 0 && !p.retire(k) {
+        if f.pass_count != 0 {
+            if f.pass_count as usize > f.pass.len() {
                 return Err(EINVAL);
+            }
+            // Retire in submission order so displacement retains the newest hardware pass slot.
+            for &k in &f.pass[..f.pass_count as usize] {
+                if k as usize >= sizes::RENDER_SLOTS || !p.retire(k as usize) {
+                    return Err(EINVAL);
+                }
+            }
+        } else {
+            for k in 0..sizes::RENDER_SLOTS {
+                if f.pass_mask & (1 << k) != 0 && !p.retire(k) {
+                    return Err(EINVAL);
+                }
             }
         }
         self.compute.lifetime = c;
@@ -1213,6 +1255,7 @@ impl Slots {
         }
         self.pass_busy &= !f.pass_mask;
         f.slot_count = 0;
+        f.pass_count = 0;
         f.pass_mask = 0;
         f.ct_count = 0;
         Ok(())
@@ -1233,6 +1276,7 @@ impl Slots {
         }
         self.pass_busy &= !f.pass_mask;
         f.slot_count = 0;
+        f.pass_count = 0;
         f.pass_mask = 0;
         f.ct_count = 0;
     }
@@ -1257,6 +1301,7 @@ impl Slots {
         }
         self.pass_busy &= !f.pass_mask;
         f.slot_count = 0;
+        f.pass_count = 0;
         f.pass_mask = 0;
         f.ct_count = 0;
     }
