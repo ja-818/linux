@@ -9599,7 +9599,16 @@ static int dcp_platform_suspend(struct device *dev)
 	if (dcp->hdmi_hpd_irq) {
 		disable_irq(dcp->hdmi_hpd_irq);
 		if (!dcp->active_typec_route) {
-			disconnected_hpd_event(dcp->connector);
+			/*
+			 * A display a DPMS off released (hdmi_crtc_off) whose cable is still
+			 * attached stays connected through the sleep, as it does while it is
+			 * off. Otherwise it reads disconnected after the resume, and nothing
+			 * connects it again while its CRTC is off, so DPMS on cannot light it.
+			 * The next dcp_poweron() retrains its link.
+			 */
+			if (!READ_ONCE(dcp->hdmi_crtc_off) ||
+			    !gpiod_get_value_cansleep(dcp->hdmi_hpd))
+				disconnected_hpd_event(dcp->connector);
 			dcp_dptx_disconnect(dcp, 0);
 		}
 	}
@@ -9659,6 +9668,12 @@ static int dcp_platform_resume(struct device *dev)
 	/* Observe future edges before sampling any edges lost in sleep. */
 	if (dcp->hdmi_hpd_irq)
 		dcp_fabric_run_resume(&dcp_resume_ops, dcp);
+	/* A display kept connected through the sleep, unplugged during it. */
+	if (dcp->hdmi_hpd_irq && READ_ONCE(dcp->hdmi_crtc_off) &&
+	    !gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
+		WRITE_ONCE(dcp->hdmi_crtc_off, false);
+		disconnected_hpd_event(dcp->connector);
+	}
 	if (dcp->external_native)
 		enable_work(&dcp->external_audio_work);
 
